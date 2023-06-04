@@ -1,0 +1,411 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: SAM Application Pipeline
+#--------------------------------#
+# Parameters
+#--------------------------------#
+Parameters:
+  PJPrefix:
+    Description: The project prefix
+    Type: String
+    Default: hayashi-test
+  EnvPrefix:
+    Description: The environment type
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - stg
+      - prod
+    ConstraintDescription: Must be a dev or stg or prod
+#--------------------------------#
+# Mappings
+#--------------------------------#
+Mappings:
+  EnvMap:
+    dev:
+      BranchName: dev
+    stg:
+      BranchName: stg
+    prod:
+      BranchName: main
+#--------------------------------#
+# Parameters
+#--------------------------------#
+Resources:
+  ##################################
+  # Frontend Hosting for API Docs
+  ##################################
+  #--------------------------------#
+  # S3
+  #--------------------------------#
+  # Create a S3 Origin Bucket
+  HostingBucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      BucketName: !Sub ${PJPrefix}-hosting-api-docs-bucket-${EnvPrefix}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  # Create a S3 Origin BucketPolicy
+  BucketPolicy:
+    DependsOn: 
+      - HostingBucket
+      - Distribution
+    Type: AWS::S3::BucketPolicy
+    Properties: 
+      Bucket: !Ref HostingBucket
+      PolicyDocument: 
+        Version: 2008-10-17
+        Statement: 
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal: 
+              Service: 
+                - cloudfront.amazonaws.com
+            Action: 
+              - s3:GetObject
+            Resource: 
+              - !Sub ${HostingBucket.Arn}/*
+            Condition: 
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+  #--------------------------------#
+  # CloudFront
+  #--------------------------------#
+  # Create a Origin Access Control
+  OAC: 
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties: 
+      OriginAccessControlConfig:
+        Description: Access Control
+        Name: !Sub ${PJPrefix}-api-docs-oac-${EnvPrefix}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  # Create CloudFront Distribution
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties: 
+      DistributionConfig:
+        Comment: Distribution for API Docs Hosting
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        DefaultCacheBehavior: 
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          TargetOriginId: S3
+          Compress: true
+          ViewerProtocolPolicy: allow-all
+        DefaultRootObject: index.html
+        Enabled: true
+        Origins: 
+          - DomainName:  !GetAtt HostingBucket.RegionalDomainName
+            Id: S3
+            OriginAccessControlId: !GetAtt OAC.Id
+            S3OriginConfig: 
+              OriginAccessIdentity: '' # OAI must be defined, but should be blank to use OAC.
+        PriceClass: PriceClass_All
+  
+  ##################################
+  # CI/CD Pipeline
+  ##################################
+  #--------------------------------#
+  # CodeCommit
+  #--------------------------------#
+  # Create a CodeCommit repository
+  Repository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub ${PJPrefix}-api-repo-${EnvPrefix}
+  #--------------------------------#
+  # KMS
+  #--------------------------------#
+  # Create a KMS key for Artifact Store in CodePipeline
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for CodePipeline
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow access for CodePipeline service
+            Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow access for CodeBuild service
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow access for S3 service
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:Decrypt
+            Resource: '*'
+  #--------------------------------#
+  # S3
+  #--------------------------------#
+  # Create Artifact Store in CodePipeline
+  ArtifactStore:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - KMSKey
+    Properties:
+      BucketName: !Sub ${PJPrefix}-api-artifact-store-${EnvPrefix}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !GetAtt KMSKey.Arn
+              SSEAlgorithm: aws:kms
+  #--------------------------------#
+  # IAM
+  #--------------------------------#
+  # Create IAM Role for CodePipeline
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    DependsOn:
+      - ArtifactStore
+      - BuildProject
+    Properties:
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: codecommit-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetRepository
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:UploadArchive
+                  - codecommit:CancelUploadArchive
+                Resource: !GetAtt Repository.Arn
+        - PolicyName: codebuild-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt BuildProject.Arn
+        - PolicyName: s3-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - !GetAtt ArtifactStore.Arn
+                  - !Sub ${ArtifactStore.Arn}/*
+        - PolicyName: kms-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: !GetAtt KMSKey.Arn
+        - PolicyName: cloudfront-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudfront:GetInvalidation
+                  - cloudfront:CreateInvalidation
+                Resource:  !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+  # Create IAM Role for CodeBuild Project
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    DependsOn:
+      - ArtifactStore
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: log-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+        - PolicyName: s3-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - !GetAtt ArtifactStore.Arn
+                  - !Sub ${ArtifactStore.Arn}/*
+        - PolicyName: kms-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: !GetAtt KMSKey.Arn
+        - PolicyName: cloudfront-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudfront:GetInvalidation
+                  - cloudfront:CreateInvalidation
+                Resource:  !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+  #--------------------------------#
+  # CodeBuild
+  #--------------------------------#
+  # Create a Build Project to build & deploy
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn:
+      - CodeBuildServiceRole
+      - ArtifactStore
+    Properties:
+      Name: !Sub ${PJPrefix}-api-build-project-${EnvPrefix}
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: './buildspec.yaml'
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:6.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: ENV
+            Value: !Ref EnvPrefix
+          - Name: HOSTING_BUCKET_NAME
+            Value: !Ref HostingBucket
+          - Name: DISTRIBUTION_ID
+            Value: !Ref Distribution
+      TimeoutInMinutes: 60
+      EncryptionKey: !GetAtt KMSKey.Arn
+  #--------------------------------#
+  # CodePipeline
+  #--------------------------------#
+  # Create a CodePipeline
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    DependsOn:
+      - CodePipelineServiceRole
+      - KMSKey
+      - ArtifactStore
+      - Repository
+    Properties:
+      Name: !Sub ${PJPrefix}-api-pipeline-${EnvPrefix}
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      Stages: 
+        -
+          Name: Source
+          Actions: 
+            - 
+              Name: SourceAction
+              ActionTypeId:
+                Owner: AWS
+                Category: Source
+                Version: '1'
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                RepositoryName: !GetAtt Repository.Name
+                BranchName: !FindInMap [EnvMap,!Ref EnvPrefix,BranchName]
+                OutputArtifactFormat: CODE_ZIP
+                PollForSourceChanges: false
+              RunOrder: 1
+        -
+          Name: Build 
+          Actions: 
+            - 
+              Name: BuildAction
+              ActionTypeId:
+                Owner: AWS
+                Category: Build
+                Version: '1'
+                Provider: CodeBuild
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref BuildProject 
+              RunOrder: 1
+      ArtifactStore:
+        Type: S3
+        EncryptionKey:
+          Type: KMS
+          Id: !Ref KMSKey
+        Location: !Ref ArtifactStore
+        

@@ -1,0 +1,559 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: ECS/Fargate with Pipeline
+#--------------------------------#
+# Parameters
+#--------------------------------#
+Parameters:
+  # Project prefix
+  PJPrefix:
+    Description: The project prefix
+    Type: String
+    Default: hayashi-test
+  # Environment prefix
+  EnvPrefix:
+    Description: The environment type
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - stg
+      - prd
+    ConstraintDescription: Must be a dev or stg or prod
+#--------------------------------#
+# Mappings
+#--------------------------------#
+Mappings:
+  EnvMap:
+    dev:
+      BranchName: dev
+    stg:
+      BranchName: stg
+    prod:
+      BranchName: main
+#--------------------------------#
+# Resources
+#--------------------------------#
+Resources:
+  ##################################
+  # Network
+  ##################################
+  #--------------------------------#
+  # VPC
+  #--------------------------------#
+  # Create a VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 192.168.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-vpc-${EnvPrefix}
+  #--------------------------------#
+  # Subnet
+  #--------------------------------#
+  # Create Private Subnet A
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: eu-west-1a
+      CidrBlock: 192.168.100.0/24
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-pri-sub-a-${EnvPrefix}
+  # Create Private Subnet B
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: eu-west-1b
+      CidrBlock: 192.168.110.0/24
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-pri-sub-b-${EnvPrefix}
+  #--------------------------------#
+  # Route Table
+  #--------------------------------#
+  # Create a Route Table for Private Subnet A
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-pri-rt-a-${EnvPrefix}
+  # Create a Route Table for Private Subnet B
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-pri-rt-b-${EnvPrefix}
+  # Associate Private Subnet A and Route Table A
+  PrivateSubnetRouteTableAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTableA
+  # Associate Private Subnet B and Route Table B
+  PrivateSubnetRouteTableAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTableB
+
+  ##################################
+  # Compute
+  ##################################
+  #--------------------------------#
+  # Security Group
+  #--------------------------------#
+  # Create a Security Group for ECS Service
+  ECSServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Used by ECS Service
+      GroupName: !Sub ${PJPrefix}-ecs-service-sg-${EnvPrefix}
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          FromPort: -1
+          ToPort: -1
+          IpProtocol: -1
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          FromPort: -1
+          ToPort: -1
+          IpProtocol: -1
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-ecs-service-sg-${EnvPrefix}
+  #--------------------------------#
+  # IAM
+  #--------------------------------#
+  # Create a ECS Task Role
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${PJPrefix}-ecs-task-role-${EnvPrefix}
+      AssumeRolePolicyDocument:
+        Version: 2008-10-17
+        Statement: 
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+  # Create a ECS Task Execution Role
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${PJPrefix}-ecs-task-execution-role-${EnvPrefix}
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        - arn:aws:iam::aws:policy/SecretsManagerReadWrite
+  #--------------------------------#
+  # CloudWatch Logs
+  #--------------------------------#
+  # Create a CloudWatch log group for ECS/Fargate
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/ecs/application-logs/
+  #--------------------------------#
+  # ECR
+  #--------------------------------#
+  # Create a ECR Repository
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    Properties:
+      RepositoryName: !Sub ${PJPrefix}-ecr-repo-${EnvPrefix}
+      ImageScanningConfiguration:
+        ScanOnPush: true
+  #--------------------------------#
+  # ECS
+  #--------------------------------#
+  # Create a ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${PJPrefix}-cluster-${EnvPrefix}
+  # Create a ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${PJPrefix}-ecs-service-${EnvPrefix}
+      TaskDefinition: !Ref ECSTaskDefinition
+      Cluster: !Ref ECSCluster
+      DesiredCount: 0
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref ECSServiceSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnetA
+            - !Ref PrivateSubnetB
+  # Create a ECS Task Definition
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: 256
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      TaskRoleArn: !Ref ECSTaskRole
+      Family: !Sub ${PJPrefix}-family-${EnvPrefix}
+      Memory: 512
+      NetworkMode: awsvpc
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      RequiresCompatibilities:
+        - FARGATE
+      ContainerDefinitions:
+        - Name: !Sub ${PJPrefix}-container-${EnvPrefix}
+          Image: !Sub 
+            - ${RepositoryUri}:latest
+            - RepositoryUri: !GetAtt ECRRepository.RepositoryUri
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: !Ref PJPrefix
+          PortMappings:
+            - HostPort: 8080
+              Protocol: tcp
+              ContainerPort: 8080
+  
+  ##################################
+  # CI/CD Pipeline
+  ##################################
+  #--------------------------------#
+  # CodeCommit
+  #--------------------------------#
+  # Create a CodeCommit repository
+  Repository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub ${PJPrefix}-backend-repo-${EnvPrefix}
+  #--------------------------------#
+  # KMS
+  #--------------------------------#
+  # Create a KMS key for Artifact Store in CodePipeline
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for CodePipeline
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow access for CodePipeline service
+            Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow access for CodeBuild service
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow access for S3 service
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:Decrypt
+            Resource: '*'
+  #--------------------------------#
+  # S3
+  #--------------------------------#
+  # Create Artifact Store in CodePipeline
+  ArtifactStore:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - KMSKey
+    Properties:
+      BucketName: !Sub ${PJPrefix}-backend-artifact-store-${EnvPrefix}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !GetAtt KMSKey.Arn
+              SSEAlgorithm: aws:kms
+  #--------------------------------#
+  # IAM
+  #--------------------------------#
+  # Create IAM Role for CodePipeline
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    DependsOn:
+      - ArtifactStore
+      - BuildProject
+    Properties:
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: codecommit-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetRepository
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:UploadArchive
+                  - codecommit:CancelUploadArchive
+                Resource: !GetAtt Repository.Arn
+        - PolicyName: codebuild-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt BuildProject.Arn
+        - PolicyName: s3-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - !GetAtt ArtifactStore.Arn
+                  - !Sub ${ArtifactStore.Arn}/*
+        - PolicyName: kms-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: !GetAtt KMSKey.Arn
+        - PolicyName: ecr-repo-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+        - PolicyName: ecr-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !GetAtt ECRRepository.Arn
+  # Create IAM Role for CodeBuild Project
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    DependsOn:
+      - ArtifactStore
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: log-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+        - PolicyName: s3-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - !GetAtt ArtifactStore.Arn
+                  - !Sub ${ArtifactStore.Arn}/*
+        - PolicyName: kms-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: !GetAtt KMSKey.Arn
+        - PolicyName: ecr-repo-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+        - PolicyName: ecr-access-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !GetAtt ECRRepository.Arn
+  #--------------------------------#
+  # CodeBuild
+  #--------------------------------#
+  # Create a Build Project to build & deploy
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn:
+      - CodeBuildServiceRole
+      - ArtifactStore
+    Properties:
+      Name: !Sub ${PJPrefix}-backend-build-project-${EnvPrefix}
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: './buildspec.yaml'
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:6.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ENV
+            Value: !Ref EnvPrefix
+          - Name: ECR_REPOSITORY_NAME
+            Value: !Ref ECRRepository
+          - Name: ECR_REPOSITORY_URI
+            Value: !GetAtt ECRRepository.RepositoryUri
+      TimeoutInMinutes: 60
+      EncryptionKey: !GetAtt KMSKey.Arn
+  #--------------------------------#
+  # CodePipeline
+  #--------------------------------#
+  # Create a CodePipeline
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    DependsOn:
+      - CodePipelineServiceRole
+      - KMSKey
+      - ArtifactStore
+      - Repository
+    Properties:
+      Name: !Sub ${PJPrefix}-backend-pipeline-${EnvPrefix}
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      Stages: 
+        -
+          Name: Source
+          Actions: 
+            - 
+              Name: SourceAction
+              ActionTypeId:
+                Owner: AWS
+                Category: Source
+                Version: '1'
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                RepositoryName: !GetAtt Repository.Name
+                BranchName: !FindInMap [EnvMap,!Ref EnvPrefix,BranchName]
+                OutputArtifactFormat: CODE_ZIP
+                PollForSourceChanges: false
+              RunOrder: 1
+        -
+          Name: Build 
+          Actions: 
+            - 
+              Name: BuildAction
+              ActionTypeId:
+                Owner: AWS
+                Category: Build
+                Version: '1'
+                Provider: CodeBuild
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref BuildProject 
+              RunOrder: 1
+      ArtifactStore:
+        Type: S3
+        EncryptionKey:
+          Type: KMS
+          Id: !Ref KMSKey
+        Location: !Ref ArtifactStore
+
+
+
+

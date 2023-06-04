@@ -1,0 +1,22 @@
+#---------------------------#
+# Environment Variables
+# ・ENV_PREFIX
+# ・SAM_RESOURCE_BUCKET
+# ・API_DOCS_BUCKET
+#---------------------------#
+version: 0.2
+phases:
+  build:
+    commands:
+      - aws cloudformation package
+        --template-file template.yaml
+        --s3-bucket ${S3_BUCKET}
+        --output-template-file output.yml
+
+      - aws cloudformation deploy
+        --template-file output.yml
+        --s3-bucket $S3_BUCKET
+        --stack-name $STACKNAME
+        --capabilities CAPABILITY_IAM
+        --region ap-northeast-1
+        --parameter-overrides Env=$ENV

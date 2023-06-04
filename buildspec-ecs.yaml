@@ -1,0 +1,19 @@
+#---------------------------#
+# Environment Variables
+# ・ENV_PREFIX
+# ・ECR_REPOSITORY_NAME
+# ・ECR_REPOSITORY_URI
+#---------------------------#
+version: 0.2
+phases:
+  pre_build:
+    commands:
+      - aws ecr get-login-password --region eu-west-1 | docker login --username AWS --password-stdin ${ECR_REPOSITORY_URI}
+  build:
+    on-failure: ABORT
+    commands:
+      - docker build -t ${ECR_REPOSITORY_NAME} .
+  post_build:
+    commands:
+      - docker tag ${ECR_REPOSITORY_NAME}:latest ${ECR_REPOSITORY_URI}:latest
+      - docker push ${ECR_REPOSITORY_URI}:latest

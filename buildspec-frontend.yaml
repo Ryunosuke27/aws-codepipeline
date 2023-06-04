@@ -1,0 +1,26 @@
+#---------------------------#
+# Environment Variables
+# ・ENV_PREFIX
+# ・HOSTING_BUCKET_NAME
+# ・DISTRIBUTION_ID
+#---------------------------#
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      nodejs: 16 # Codebuild Image does not support v18
+    commands:
+      - n 18
+      - npm i --production
+  build:
+    commands:
+      - npm run build:${ENV_PREFIX}
+      - npm run test:${ENV_PREFIX}
+  post_build:
+    commands:
+      # Upload to S3 Bucket
+      - aws s3 sync . s3://${HOSTING_BUCKET_NAME}
+      # Clear CloudFront Distribution cache
+      - aws cloudfront create-invalidation
+          --distribution-id ${DISTRIBUTION_ID}
+          --paths '/*'
